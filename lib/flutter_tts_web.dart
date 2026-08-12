@@ -34,7 +34,24 @@ class FlutterTtsPlugin {
     channel.setMethodCallHandler(instance.handleMethodCall);
   }
 
-  late final SpeechSynthesisUtterance utterance;
+  /// Identifies the utterance in flight. Each set of handlers captures the id
+  /// its utterance was created with and ignores everything else, so the `end`
+  /// that `cancel` fires on an interrupted utterance is not reported as the
+  /// one replacing it having finished.
+  ///
+  /// An int rather than comparing the utterance objects: these are extension
+  /// types over `JSObject`, and `identical` on those is not dependable across
+  /// compilers.
+  int _speechId = 0;
+
+  /// Utterance settings, kept here rather than on a long-lived utterance
+  /// because every [_speak] builds its own.
+  SpeechSynthesisVoice? _voice;
+  String? _language;
+  double? _rate;
+  double? _volume;
+  double? _pitch;
+
   List<SpeechSynthesisVoice> voices = [];
   List<String> languages = [];
   Timer? t;
@@ -42,22 +59,28 @@ class FlutterTtsPlugin {
 
   FlutterTtsPlugin() {
     try {
-      utterance = SpeechSynthesisUtterance();
-      _listeners();
+      // Discarded — this only proves the browser has the API.
+      SpeechSynthesisUtterance();
       supported = true;
     } catch (e) {
       print('Initialization of TTS failed. Functions are disabled. Error: $e');
     }
   }
 
-  void _listeners() {
+  void _listeners(SpeechSynthesisUtterance utterance, int id) {
     utterance.onStart = (JSAny e) {
+      if (id != _speechId) return;
       ttsState = TtsState.playing;
       channel.invokeMethod("speak.onStart", null);
       var bLocal = (utterance.voice?.isLocalService ?? false);
       if (!bLocal) {
+        // Chrome cuts a remote voice off after roughly 15 seconds unless the
+        // queue is nudged. Keep nudging until this utterance is done — the
+        // nudge itself moves the state to `continued`, so testing for
+        // `playing` here would stop after a single pass.
+        t?.cancel();
         t = Timer.periodic(Duration(seconds: 14), (t) {
-          if (ttsState == TtsState.playing) {
+          if (id == _speechId && ttsState != TtsState.stopped) {
             synth.pause();
             synth.resume();
           } else {
@@ -66,41 +89,37 @@ class FlutterTtsPlugin {
         });
       }
     }.toJS;
-    // js.JsFunction.withThis((e) {
-    //   ttsState = TtsState.playing;
-    //   channel.invokeMethod("speak.onStart", null);
-    // });
+
     utterance.onEnd = (JSAny e) {
-      ttsState = TtsState.stopped;
-      if (_speechCompleter != null) {
-        _speechCompleter?.complete();
-        _speechCompleter = null;
-      }
-      t?.cancel();
+      if (id != _speechId) return;
+      _finish();
       channel.invokeMethod("speak.onComplete", null);
     }.toJS;
 
     utterance.onPause = (JSAny e) {
+      if (id != _speechId) return;
       ttsState = TtsState.paused;
       channel.invokeMethod("speak.onPause", null);
     }.toJS;
 
     utterance.onResume = (JSAny e) {
+      if (id != _speechId) return;
       ttsState = TtsState.continued;
       channel.invokeMethod("speak.onContinue", null);
     }.toJS;
 
     utterance.onError = (JSObject event) {
-      ttsState = TtsState.stopped;
-      if (_speechCompleter != null) {
-        _speechCompleter = null;
-      }
-      t?.cancel();
+      if (id != _speechId) return;
+      // Releases anyone awaiting completion — an error ends this utterance
+      // just as surely as `end` does, and leaving the completer hanging
+      // strands the caller forever.
+      _finish();
       print(event); // Log the entire event object to get more details
       channel.invokeMethod("speak.onError", event["error"]);
     }.toJS;
 
     utterance.onBoundary = (JSObject event) {
+      if (id != _speechId) return;
       int charIndex = event['charIndex'] as int;
       String name = event['name'] as String;
       if (name == 'sentence') return;
@@ -126,9 +145,7 @@ class FlutterTtsPlugin {
     switch (call.method) {
       case 'speak':
         final text = call.arguments as String?;
-        if (awaitSpeakCompletion) {
-          _speechCompleter = Completer();
-        }
+        if (text == null || text.isEmpty) return null;
         _speak(text);
         if (awaitSpeakCompletion) {
           return _speechCompleter?.future;
@@ -178,22 +195,53 @@ class FlutterTtsPlugin {
     }
   }
 
-  void _speak(String? text) {
-    if (text == null || text.isEmpty) return;
-    if (ttsState == TtsState.stopped || ttsState == TtsState.paused) {
-      utterance.text = text;
-      if (ttsState == TtsState.paused) {
-        synth.resume();
-      } else {
-        synth.speak(utterance);
-      }
+  void _speak(String text) {
+    // Clear the queue and speak unconditionally, rather than gating on
+    // `ttsState`. That state only leaves `playing` when the browser fires
+    // `end` or `error`, and a remote voice that stalls fires neither — which
+    // used to mute every later utterance for the life of the page, with
+    // nothing able to reset it. Cancelling fires the `end` that clears it.
+    //
+    // `resume` as well as `cancel` because Chrome keeps `paused` set through
+    // a `cancel`, and the keep-alive above pauses the queue every 14 seconds.
+    _finish();
+    synth.cancel();
+    synth.resume();
+
+    final id = _speechId;
+    final utterance = SpeechSynthesisUtterance();
+    utterance.text = text;
+    if (_voice != null) utterance.voice = _voice;
+    if (_language != null) utterance.lang = _language!;
+    if (_rate != null) utterance.rate = _rate!;
+    if (_volume != null) utterance.volume = _volume!;
+    if (_pitch != null) utterance.pitch = _pitch!;
+    _listeners(utterance, id);
+
+    if (awaitSpeakCompletion) {
+      _speechCompleter = Completer<dynamic>();
     }
+    synth.speak(utterance);
   }
 
   void _stop() {
-    if (ttsState != TtsState.stopped) {
-      synth.cancel();
-    }
+    _finish();
+    // Unconditional as well: `cancel` on an idle queue does nothing, and the
+    // `resume` clears a `paused` flag that `cancel` alone leaves set.
+    synth.cancel();
+    synth.resume();
+  }
+
+  /// Ends whatever is in flight — orphans its events, stops the keep-alive,
+  /// and releases anyone awaiting completion.
+  void _finish() {
+    _speechId++;
+    t?.cancel();
+    t = null;
+    ttsState = TtsState.stopped;
+    final completer = _speechCompleter;
+    _speechCompleter = null;
+    if (completer != null && !completer.isCompleted) completer.complete();
   }
 
   void _pause() {
@@ -202,16 +250,16 @@ class FlutterTtsPlugin {
     }
   }
 
-  void _setRate(double rate) => utterance.rate = rate;
-  void _setVolume(double volume) => utterance.volume = volume;
-  void _setPitch(double pitch) => utterance.pitch = pitch;
+  void _setRate(double rate) => _rate = rate;
+  void _setVolume(double volume) => _volume = volume;
+  void _setPitch(double pitch) => _pitch = pitch;
   void _setLanguage(String language) {
     var targetList = synth.getVoices().toDart.where((e) {
       return e.lang.toLowerCase().startsWith(language.toLowerCase());
     });
     if (targetList.isNotEmpty) {
-      utterance.voice = targetList.first;
-      utterance.lang = targetList.first.lang;
+      _voice = targetList.first;
+      _language = targetList.first.lang;
     }
   }
 
@@ -221,7 +269,7 @@ class FlutterTtsPlugin {
       return voice["name"] == e.name && voice["locale"] == e.lang;
     });
     if (targetList.isNotEmpty) {
-      utterance.voice = targetList.first;
+      _voice = targetList.first;
     }
   }
 
